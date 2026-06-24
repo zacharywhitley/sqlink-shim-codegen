@@ -129,6 +129,10 @@ fn init_inner(conn: Connection) -> Result<bool> {
         .map_err(|e| rusqlite::Error::UserFunctionError(
             format!("aggregate registration: {e}").into()
         ))?;
+    table_functions::register_all(&conn)
+        .map_err(|e| rusqlite::Error::UserFunctionError(
+            format!("table function registration: {e}").into()
+        ))?;
 
     // Returning `true` means "extension fully initialized — no
     // need to keep it loaded across DB sessions". `false` would
@@ -672,19 +676,75 @@ fn register_aggregate(conn: &Connection, sql_name: &str, arity: i32) -> Result<(
 
 pub fn table_functions_rs(plan: &BridgePlan) -> String {
     let mut s = generated_header();
-    s.push_str(r##"//! Table-function (UDTF) registration.
+    s.push_str(
+r##"//! Table-function (UDTF) registration.
 //!
-//! Mapped to SQLite virtual tables via sqlite3_module. Each
-//! shim UDTF becomes one virtual table whose xBestIndex/xFilter
-//! pulls rows from the shim.
+//! ## Phase 4c — SCAFFOLDED (2026-06-24)
+//!
+//! UDTFs are real new infrastructure (not just more emit code).
+//! rusqlite has a working `VTab` API in `rusqlite::vtab` —
+//! see `series.rs` in the rusqlite source for the canonical
+//! per-UDTF pattern (~200 LOC).
+//!
+//! Architecture for shipping this
+//!
+//!   1. Define one concrete `ShimVTab` type with
+//!      `Aux = Arc<dyn TableFunctionDef>`. Each
+//!      `conn.create_module("name", non_eponymous_module::<ShimVTab>(), Some(def))`
+//!      call passes a different aux but reuses the same VTab
+//!      type — same pattern as the scalar dispatcher.
+//!
+//!   2. `ShimVTab::connect` calls `def.output_schema(...)` to
+//!      build a `CREATE TABLE` schema string for SQLite. Each
+//!      column maps to a SQLite affinity (BLOB / TEXT / REAL /
+//!      INTEGER) based on the shim's DataType.
+//!
+//!   3. `ShimVTab::best_index` declares all parameter columns
+//!      as needed-for-filter so SQLite passes them through.
+//!
+//!   4. `ShimVTabCursor::filter(args)` calls
+//!      `def.execute(&function_values)` and stores the
+//!      returned `Box<dyn TableFunctionIterator>`.
+//!
+//!   5. `ShimVTabCursor::next` advances via
+//!      `iter.next_row()`; cursor caches the current row;
+//!      `column(i)` returns the i-th cell mapped to ToSqlOutput.
+//!
+//! Why I'm scaffolding instead of shipping
+//!
+//!   The 7 PostGIS UDTFs (st_dump, st_dumppoints, st_dumprings,
+//!   st_dumpsegments, st_hexagongrid, st_squaregrid,
+//!   st_subdivide) each return multiple rows per input. The
+//!   VTab + Cursor + best_index plumbing is ~300-400 LOC of
+//!   real work that warrants its own session. The architecture
+//!   above is the proven path — pull `series.rs` from
+//!   rusqlite/src/vtab/ as the reference implementation.
+
+use rusqlite::{Connection, Result};
+
+/// Phase-4c no-op. The shim's UDTFs are captured in the
+/// registry; the day someone writes the ShimVTab adapter
+/// (see module docs), this becomes a loop over
+/// registry::all_table_functions() registering each.
+pub fn register_all(_conn: &Connection) -> Result<()> {
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// UDTFs the shim publishes.
+// ----------------------------------------------------------------------
 
 "##);
     for ext in &plan.extensions {
+        s.push_str(&format!("// === extension: {} ===\n", ext.name));
         for tf in &ext.table_functions {
-            s.push_str(&format!("// udtf `{}`\n", tf.canonical_name));
+            let nargs = tf.param_signatures.first().map(|v| v.len()).unwrap_or(0);
+            s.push_str(&format!("// udtf `{}` (arity={})\n", tf.canonical_name, nargs));
+            if !tf.aliases.is_empty() {
+                s.push_str(&format!("//   aliases: {}\n", tf.aliases.join(", ")));
+            }
         }
     }
-    s.push_str("\n// TODO: emit sqlite3_create_module_v2 calls.\n");
     s
 }
 
