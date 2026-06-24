@@ -182,50 +182,68 @@ use datafission_functions::types::FunctionValue;
 
 use crate::registry;
 
-/// Register every Phase-1 scalar against the given connection.
+/// Register every scalar the shim publishes.
+///
+/// Phase 2 (2026-06-24): registration is now arity-agnostic. The
+/// `dispatch_scalar` helper marshals every arg through
+/// `ValueRef` → `FunctionValue` (works for any SQLite type) and
+/// every result back through `function_value_to_tosql` (handles
+/// every `FunctionValue` variant). So one registration loop
+/// covers every signature shape — no per-shape marker structs
+/// needed because SQLite has dynamic typing through its
+/// `ValueRef` enum.
+///
+/// Variadic functions (arity = -1) are emitted with rusqlite's
+/// `arity = -1` convention.
 pub fn register_all(conn: &Connection) -> Result<()> {
 "##,
     );
 
     let mut emitted = 0;
+    let mut alias_count = 0;
     for ext in &plan.extensions {
         for sc in &ext.scalars {
-            // Phase 1: only ST_GeomFromText is wired live. The
-            // rest are commented out (with arity / aliases) so a
-            // future phase can flip them on without re-running the
-            // codegen.
-            let is_phase1 = sc.canonical_name == "st_geomfromtext";
-            if is_phase1 {
-                let nargs = sc.param_signatures.first().map(|v| v.len()).unwrap_or(1) as i32;
-                let det = if sc.is_deterministic { "SQLITE_DETERMINISTIC" } else { "0u32.into()" };
-                s.push_str(&format!(
-                    "    register_scalar(conn, \"{name}\", {nargs}, {det})?;\n",
-                    name = sc.canonical_name,
-                    nargs = nargs,
-                    det = if sc.is_deterministic {
-                        "FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_UTF8"
-                    } else {
-                        "FunctionFlags::SQLITE_UTF8"
-                    },
-                ));
-                for alias in &sc.aliases {
-                    s.push_str(&format!(
-                        "    register_scalar(conn, \"{alias}\", {nargs}, {det})?; // alias of {name}\n",
-                        alias = alias, nargs = nargs,
-                        det = if sc.is_deterministic {
-                            "FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_UTF8"
-                        } else {
-                            "FunctionFlags::SQLITE_UTF8"
-                        },
-                        name = sc.canonical_name,
-                    ));
+            // Determine arity: if every variant has the same arg
+            // count, use that; otherwise use -1 (rusqlite's
+            // variadic marker). SQLite itself has no overload
+            // mechanism — a name resolves to one function — so
+            // when multiple variants exist, our wrapper accepts
+            // any count and lets the shim's execute() validate.
+            let variants = &sc.param_signatures;
+            let arity = if variants.is_empty() {
+                -1i32
+            } else {
+                let first = variants[0].len();
+                if variants.iter().all(|v| v.len() == first) {
+                    first as i32
+                } else {
+                    -1
                 }
-                emitted += 1;
+            };
+            let flags = if sc.is_deterministic {
+                "FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_UTF8"
+            } else {
+                "FunctionFlags::SQLITE_UTF8"
+            };
+            s.push_str(&format!(
+                "    register_scalar(conn, \"{name}\", {arity}, {flags})?;\n",
+                name = sc.canonical_name,
+            ));
+            for alias in &sc.aliases {
+                s.push_str(&format!(
+                    "    register_scalar(conn, \"{alias}\", {arity}, {flags})?; // alias of {name}\n",
+                    alias = alias, name = sc.canonical_name,
+                ));
+                alias_count += 1;
             }
+            emitted += 1;
         }
     }
+    s.push_str(&format!(
+        "    // Phase 2: {emitted} canonical + {alias_count} alias names registered.\n"
+    ));
     if emitted == 0 {
-        s.push_str("    // No Phase-1 scalars matched in this interface DB.\n");
+        s.push_str("    // (no scalars in this interface DB)\n");
     }
 
     s.push_str(
@@ -317,30 +335,8 @@ fn function_value_to_tosql(v: FunctionValue) -> ToSqlOutput<'static> {
     ToSqlOutput::Owned(value)
 }
 
-// ----------------------------------------------------------------------
-// Comment block: every scalar in this interface DB. Uncomment
-// the matching `register_scalar(...)` call in `register_all`
-// above to enable a name in a future phase.
-// ----------------------------------------------------------------------
-
 "##,
     );
-
-    for ext in &plan.extensions {
-        s.push_str(&format!("// === extension: {} ===\n", ext.name));
-        for sc in &ext.scalars {
-            if sc.canonical_name == "st_geomfromtext" { continue; }
-            let nargs = sc.param_signatures.first().map(|v| v.len()).unwrap_or(0);
-            s.push_str(&format!(
-                "// scalar `{}` (deterministic={}, propagates_null={}, arity={}, return={})\n",
-                sc.canonical_name, sc.is_deterministic, sc.propagates_null, nargs, sc.return_type
-            ));
-            if !sc.aliases.is_empty() {
-                s.push_str(&format!("//   aliases: {}\n", sc.aliases.join(", ")));
-            }
-        }
-        s.push('\n');
-    }
     s
 }
 

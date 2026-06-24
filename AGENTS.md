@@ -177,16 +177,65 @@ to SQLite.
 
 #### Phase 1 known limitations (intentional — defer)
 
-- Other scalar names are listed as comments in `scalars.rs`
-  but not registered. To turn one on, copy the
-  `register_scalar(...)` line in `register_all` and adapt the
-  arity. Each new name should JUST WORK if the shim wrapped it
-  — the dispatch is fully generic.
 - macOS system sqlite3 has `-DSQLITE_OMIT_LOAD_EXTENSION`; use
   brew's sqlite3 at `/opt/homebrew/opt/sqlite/bin/sqlite3`.
 - cdylib size: 11 MB stripped (LTO + opt-level "z"). Build
   target/ is ~3 GB during compile because wasmtime +
   postgis-wasm transitives are heavy. Acceptable for now.
+
+### Phase 2 — full scalar coverage ✅ LANDED 2026-06-24
+
+SQLite has dynamic typing through `ValueRef` (Null / Integer /
+Real / Text / Blob), so a SINGLE generic dispatcher closure
+handles every signature shape. The codegen now registers
+EVERY scalar the shim publishes — 396 canonical + 588 alias
+names = ~984 SQL function names live for PostGIS.
+
+What changed from Phase 1
+
+- `register_all` loops over every scalar in the BridgePlan
+  (no more `is_phase1 == st_geomfromtext` filter).
+- Arity computed from `param_signatures[0].len()` — uses `-1`
+  (rusqlite's variadic marker) when variants differ in arity.
+- Trailing histogram comment block is gone — every scalar is
+  live, nothing to document.
+
+Verified end-to-end (single SQLite session, all dispatched
+through the shim's wasm execute):
+
+  ST_AsText(ST_GeomFromText('POINT(1 1)'))           → POINT(1 1)
+  ST_AsText(ST_GeomFromText('LINESTRING(0 0, 1 1, 2 2)'))
+                                                     → LINESTRING(0 0,1 1,2 2)
+  ST_Length(ST_GeomFromText('LINESTRING(0 0,1 1,2 2)'))
+                                                     → 2.8284271
+  ST_Area(ST_GeomFromText('POLYGON((0 0,4 0,4 4,0 4,0 0))'))
+                                                     → 16
+  ST_Distance(POINT(0 0), POINT(3 4))                → 5
+  ST_Intersects(POLY((0 0,…)), POINT(2 2))           → 1 (true)
+  ST_Intersects(POLY((0 0,…)), POINT(10 10))         → 0 (false)
+  ST_Centroid(POLY((0 0,4 0,4 4,0 4,0 0)))           → POINT(2 2)
+  ST_AsText(ST_Buffer(POINT(0 0), 1.0))              → MULTIPOLYGON(…)
+
+Why this works without per-shape marker structs
+
+SQLite's `Context::get_raw(i)` returns a `ValueRef` whose
+variant is the SQLite storage-class at runtime. `value_ref_to_function_value`
+maps every variant; `function_value_to_tosql` maps every
+`FunctionValue` variant. So a single dispatcher closure with
+the registered arity handles any signature shape the shim
+publishes — type checking happens inside the shim's own
+`ScalarFunctionDef::execute`.
+
+This is the architectural advantage SQLite has over DuckDB for
+glue layers: dynamic typing means one dispatcher; DuckDB's
+strongly-typed vectors needed eight marker structs in ducklink
+to cover the same shape coverage.
+
+### Phase 3 — aggregates / window functions / virtual tables
+
+Next phases follow the same pattern (one register helper per
+SQLite API surface). See sqlink phase TODO list elsewhere in
+this doc.
 
 ### Phase 2 — aggregates
 
