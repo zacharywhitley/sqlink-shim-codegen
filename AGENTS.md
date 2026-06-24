@@ -90,8 +90,11 @@ The `scalar_dispatch` callback:
    from `shim-bridge-codegen-core::marshal`.
 2. Builds a 1-row batch (today: hand-off to
    `df-plugin-loader`'s scalar-invoke helper, which already
-   knows the wire format; tomorrow:
-   `WireBatchBuilder::finalize` once it's no longer a stub).
+   knows the wire format — the 2026-06-24 audit confirmed
+   row-at-a-time dispatch is the right architecture today;
+   batched dispatch would need a new shim WIT interface, see
+   shim-bridge-codegen-core AGENTS.md "Wire format contract"
+   for the analysis).
 3. Calls the shim function via the loader's dispatch surface.
 4. Reads the 1-row result back, calls `sqlite3_result_*`.
 
