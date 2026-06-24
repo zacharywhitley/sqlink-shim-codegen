@@ -282,9 +282,21 @@ fn dispatch_scalar<'a>(
 ) -> Result<ToSqlOutput<'static>> {
     let n = ctx.len();
     let mut args = Vec::with_capacity(n);
+    let mut any_null = false;
     for i in 0..n {
         let v = ctx.get_raw(i);
+        if matches!(v, ValueRef::Null) {
+            any_null = true;
+        }
         args.push(value_ref_to_function_value(v));
+    }
+    // Phase 3b (2026-06-24): honor propagates_null. Most spatial
+    // scalars are NULL-propagating per SQL-92 — if any input is
+    // NULL the result is NULL, no function call needed. Skips
+    // both the shim wasm round-trip AND the inevitable parse
+    // error from the shim trying to handle Null as bytes.
+    if any_null && def.propagates_null() {
+        return Ok(ToSqlOutput::Owned(Value::Null));
     }
     let result = def.execute(&args).map_err(|e| {
         rusqlite::Error::UserFunctionError(Box::new(std::io::Error::other(format!("{e:?}"))))
