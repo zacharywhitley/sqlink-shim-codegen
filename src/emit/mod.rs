@@ -112,8 +112,11 @@ fn init_inner(conn: Connection) -> Result<bool> {
     // to a build-time path (matches the host's runtime-loaded
     // model).
     registry::load_shim().map_err(|e| {
+        // `{e:#}` walks the anyhow chain so the user sees the
+        // underlying cause (wasm parse error, missing import,
+        // etc.) rather than just the top-level wrapper.
         rusqlite::Error::UserFunctionError(
-            format!("shim load: {e}").into()
+            format!("shim load: {e:#}").into()
         )
     })?;
 

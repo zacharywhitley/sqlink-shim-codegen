@@ -139,16 +139,41 @@ working bridges:
 
 #### Phase 1 runtime contract
 
-The generated bridge expects the composed shim wasm path in an
-env var named `<EXT>_SHIM_WASM` (e.g. `POSTGIS_SHIM_WASM`).
-Set it before `.load`:
+The generated bridge expects the composed **shim** wasm
+(NOT the upstream postgis-wasm composed) at the path in env
+var `<EXT>_SHIM_WASM`. The shim composed is what `wac plug`
+produces from the shim's `postgis.wasm` plus the upstream
+`postgis-composed.wasm`:
 
+```sh
+# 1. Build the shim
+cd $HOME/git/datafission/extensions/postgis
+cargo build --release --target wasm32-wasip2
+
+# 2. wac plug the shim against upstream
+wac plug --plug deps/postgis-composed.wasm \
+  target/wasm32-wasip2/release/postgis.wasm \
+  -o /tmp/postgis-shim-composed.wasm
+
+# 3. Use the shim composed in the env var
+export POSTGIS_SHIM_WASM=/tmp/postgis-shim-composed.wasm
+
+# 4. Load + smoke (needs sqlite3 with extension support;
+#    macOS system sqlite3 has -DSQLITE_OMIT_LOAD_EXTENSION,
+#    use brew sqlite at /opt/homebrew/opt/sqlite/bin)
+/opt/homebrew/opt/sqlite/bin/sqlite3 :memory: <<SQL
+.load ./target/release/libpostgis_sqlite_bridge
+SELECT length(ST_GeomFromText('POINT(1 1)'));        -- → 21
+SELECT hex(ST_GeomFromText('POINT(1 1)'));           -- → 01010...F03F
+SELECT length(ST_GeomFromText('POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))'));  -- → 93
+SELECT typeof(ST_GeomFromText('POINT(1 1)'));        -- → blob
+SQL
 ```
-export POSTGIS_SHIM_WASM=$HOME/git/datafission/extensions/postgis/deps/postgis-composed.wasm
-sqlite3
-sqlite> .load ./target/release/libpostgis_sqlite_bridge
-sqlite> SELECT length(ST_GeomFromText('POINT(1 1)'));  -- → 21 (WKB bytes)
-```
+
+Verified 2026-06-24: smoke produces correct WKB for POINT,
+LINESTRING, POLYGON. All 14 aliases dispatch through the same
+ScalarFunctionDef. Invalid input propagates a clean error back
+to SQLite.
 
 #### Phase 1 known limitations (intentional — defer)
 
@@ -157,11 +182,11 @@ sqlite> SELECT length(ST_GeomFromText('POINT(1 1)'));  -- → 21 (WKB bytes)
   `register_scalar(...)` line in `register_all` and adapt the
   arity. Each new name should JUST WORK if the shim wrapped it
   — the dispatch is fully generic.
-- The cdylib build pulls in wasmtime + all postgis-wasm
-  transitive deps, so target/ runs ~4 GB. `cargo check` is
-  ~70 MB. We're not optimising for cdylib size yet; consider
-  using a slimmer scalar-invoke surface in a later phase if
-  binary size becomes a problem.
+- macOS system sqlite3 has `-DSQLITE_OMIT_LOAD_EXTENSION`; use
+  brew's sqlite3 at `/opt/homebrew/opt/sqlite/bin/sqlite3`.
+- cdylib size: 11 MB stripped (LTO + opt-level "z"). Build
+  target/ is ~3 GB during compile because wasmtime +
+  postgis-wasm transitives are heavy. Acceptable for now.
 
 ### Phase 2 — aggregates
 
