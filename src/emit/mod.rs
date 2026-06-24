@@ -32,12 +32,13 @@ crate-type = ["cdylib", "rlib"]
 datafission-df-plugin-loader = {{ path = "../datafission/crates/df-plugin-loader" }}
 datafission-df-plugin-api    = {{ path = "../datafission/crates/df-plugin-api" }}
 datafission-functions        = {{ path = "../datafission/crates/functions" }}
+datafission-types            = {{ path = "../datafission/crates/types" }}
 
 # rusqlite's `loadable_extension` feature provides the
 # `Connection::extension_init2` entry-point helper; no
 # bundled libsqlite (the extension links against the host
 # SQLite at load time).
-rusqlite = {{ version = "0.32", features = ["loadable_extension", "functions"] }}
+rusqlite = {{ version = "0.32", features = ["loadable_extension", "functions", "vtab"] }}
 
 anyhow     = "1"
 once_cell  = "1"
@@ -394,6 +395,7 @@ struct ShimRegistry {{
     _ext: RuntimeWasmExtension,  // keep the wasm Store alive
     scalars: RwLock<HashMap<String, Arc<dyn ScalarFunctionDef>>>,
     aggregates: RwLock<HashMap<String, Arc<dyn AggregateFunctionDef>>>,
+    table_functions: RwLock<HashMap<String, Arc<dyn TableFunctionDef>>>,
 }}
 
 pub fn load_shim() -> Result<()> {{
@@ -410,6 +412,7 @@ pub fn load_shim() -> Result<()> {{
     let mut capture = CapturingTarget {{
         scalars: Vec::new(),
         aggregates: Vec::new(),
+        table_functions: Vec::new(),
     }};
     ext.register(&mut capture)
         .map_err(|e| anyhow::anyhow!("shim register: {{e}}"))?;
@@ -430,11 +433,20 @@ pub fn load_shim() -> Result<()> {{
         }}
         aggregates.insert(canonical, def);
     }}
+    let mut table_functions = HashMap::with_capacity(capture.table_functions.len() * 2);
+    for def in capture.table_functions {{
+        let canonical = def.name().to_string();
+        for alias in def.aliases() {{
+            table_functions.insert(alias.to_string(), Arc::clone(&def));
+        }}
+        table_functions.insert(canonical, def);
+    }}
 
     SHIM.set(ShimRegistry {{
         _ext: ext,
         scalars: RwLock::new(scalars),
         aggregates: RwLock::new(aggregates),
+        table_functions: RwLock::new(table_functions),
     }}).map_err(|_| anyhow::anyhow!("ShimRegistry already initialised"))?;
 
     Ok(())
@@ -450,13 +462,20 @@ pub fn lookup_aggregate(name: &str) -> Option<Arc<dyn AggregateFunctionDef>> {{
     r.aggregates.read().get(name).cloned()
 }}
 
-/// ExtensionTarget that captures every scalar and aggregate the
-/// shim registers. UDTFs / windows / types / system catalogs /
-/// spatial indexes are accepted as no-ops (later phases extend
-/// this).
+pub fn lookup_table_function(name: &str) -> Option<Arc<dyn TableFunctionDef>> {{
+    let r = SHIM.get()?;
+    r.table_functions.read().get(name).cloned()
+}}
+
+pub fn all_table_function_names() -> Vec<String> {{
+    let r = match SHIM.get() {{ Some(r) => r, None => return vec![] }};
+    r.table_functions.read().keys().cloned().collect()
+}}
+
 struct CapturingTarget {{
     scalars: Vec<Arc<dyn ScalarFunctionDef>>,
     aggregates: Vec<Arc<dyn AggregateFunctionDef>>,
+    table_functions: Vec<Arc<dyn TableFunctionDef>>,
 }}
 
 impl ExtensionTarget for CapturingTarget {{
@@ -479,8 +498,9 @@ impl ExtensionTarget for CapturingTarget {{
     fn register_table_function(
         &mut self,
         _namespace: &str,
-        _def: Arc<dyn TableFunctionDef>,
+        def: Arc<dyn TableFunctionDef>,
     ) -> std::result::Result<(), ExtensionError> {{
+        self.table_functions.push(def);
         Ok(())
     }}
     fn register_window_function(
@@ -679,72 +699,304 @@ pub fn table_functions_rs(plan: &BridgePlan) -> String {
     s.push_str(
 r##"//! Table-function (UDTF) registration.
 //!
-//! ## Phase 4c — SCAFFOLDED (2026-06-24)
+//! Phase 4c (2026-06-24): a single `ShimVTab` adapter
+//! parameterised by `Aux = Arc<dyn TableFunctionDef>` exposes
+//! every shim UDTF as a SQLite eponymous virtual table. Each
+//! UDTF name gets one `create_module` registration; the per-
+//! UDTF def is passed in as `aux`.
 //!
-//! UDTFs are real new infrastructure (not just more emit code).
-//! rusqlite has a working `VTab` API in `rusqlite::vtab` —
-//! see `series.rs` in the rusqlite source for the canonical
-//! per-UDTF pattern (~200 LOC).
+//! Schema construction
+//!   * `output_schema(input_types)` gives us the output columns.
+//!     They become the visible columns in the SQLite vtable.
+//!   * Each input arg becomes a hidden BLOB column. `best_index`
+//!     marks them as required-for-filter so SQLite passes
+//!     `SELECT ... FROM udtf(arg0, arg1, ...)` arguments
+//!     through to `filter()`.
 //!
-//! Architecture for shipping this
-//!
-//!   1. Define one concrete `ShimVTab` type with
-//!      `Aux = Arc<dyn TableFunctionDef>`. Each
-//!      `conn.create_module("name", non_eponymous_module::<ShimVTab>(), Some(def))`
-//!      call passes a different aux but reuses the same VTab
-//!      type — same pattern as the scalar dispatcher.
-//!
-//!   2. `ShimVTab::connect` calls `def.output_schema(...)` to
-//!      build a `CREATE TABLE` schema string for SQLite. Each
-//!      column maps to a SQLite affinity (BLOB / TEXT / REAL /
-//!      INTEGER) based on the shim's DataType.
-//!
-//!   3. `ShimVTab::best_index` declares all parameter columns
-//!      as needed-for-filter so SQLite passes them through.
-//!
-//!   4. `ShimVTabCursor::filter(args)` calls
-//!      `def.execute(&function_values)` and stores the
-//!      returned `Box<dyn TableFunctionIterator>`.
-//!
-//!   5. `ShimVTabCursor::next` advances via
-//!      `iter.next_row()`; cursor caches the current row;
-//!      `column(i)` returns the i-th cell mapped to ToSqlOutput.
-//!
-//! Why I'm scaffolding instead of shipping
-//!
-//!   The 7 PostGIS UDTFs (st_dump, st_dumppoints, st_dumprings,
-//!   st_dumpsegments, st_hexagongrid, st_squaregrid,
-//!   st_subdivide) each return multiple rows per input. The
-//!   VTab + Cursor + best_index plumbing is ~300-400 LOC of
-//!   real work that warrants its own session. The architecture
-//!   above is the proven path — pull `series.rs` from
-//!   rusqlite/src/vtab/ as the reference implementation.
+//! Cursor lifecycle
+//!   * `filter(args)` builds FunctionValues, calls
+//!     `def.execute(...)`, stores the returned iterator, and
+//!     advances to the first row.
+//!   * `next` / `eof` / `column` / `rowid` drive row-by-row
+//!     consumption of the shim's iterator.
 
+use std::sync::Arc;
+
+use rusqlite::ffi;
+use rusqlite::types::ToSql;
+use rusqlite::vtab::{
+    eponymous_only_module, Context, IndexConstraintOp, IndexInfo, VTab,
+    VTabConfig, VTabConnection, VTabCursor, Values,
+};
 use rusqlite::{Connection, Result};
 
-/// Phase-4c no-op. The shim's UDTFs are captured in the
-/// registry; the day someone writes the ShimVTab adapter
-/// (see module docs), this becomes a loop over
-/// registry::all_table_functions() registering each.
-pub fn register_all(_conn: &Connection) -> Result<()> {
-    Ok(())
-}
+use datafission_functions::traits::{TableFunctionDef, TableFunctionIterator, TableRow};
+use datafission_functions::types::FunctionValue;
 
-// ----------------------------------------------------------------------
-// UDTFs the shim publishes.
-// ----------------------------------------------------------------------
+use crate::registry;
+use crate::scalars::{function_value_to_tosql, value_ref_to_function_value};
 
+/// Register every UDTF the shim publishes.
+pub fn register_all(conn: &Connection) -> Result<()> {
 "##);
+
+    let mut canonical = 0;
+    let mut alias_count = 0;
     for ext in &plan.extensions {
-        s.push_str(&format!("// === extension: {} ===\n", ext.name));
         for tf in &ext.table_functions {
-            let nargs = tf.param_signatures.first().map(|v| v.len()).unwrap_or(0);
-            s.push_str(&format!("// udtf `{}` (arity={})\n", tf.canonical_name, nargs));
-            if !tf.aliases.is_empty() {
-                s.push_str(&format!("//   aliases: {}\n", tf.aliases.join(", ")));
+            s.push_str(&format!(
+                "    register_udtf(conn, \"{name}\")?;\n",
+                name = tf.canonical_name,
+            ));
+            for alias in &tf.aliases {
+                s.push_str(&format!(
+                    "    register_udtf(conn, \"{alias}\")?; // alias of {name}\n",
+                    alias = alias, name = tf.canonical_name,
+                ));
+                alias_count += 1;
             }
+            canonical += 1;
         }
     }
+    s.push_str(&format!(
+        "    // Phase 4c: {canonical} canonical + {alias_count} alias UDTFs registered.\n"
+    ));
+    if canonical == 0 {
+        s.push_str("    // (no UDTFs in this interface DB)\n");
+    }
+
+    s.push_str(
+r##"    Ok(())
+}
+
+fn register_udtf(conn: &Connection, sql_name: &str) -> Result<()> {
+    let def = registry::lookup_table_function(sql_name).ok_or_else(|| {
+        rusqlite::Error::UserFunctionError(
+            format!("udtf `{sql_name}` not registered by the shim").into()
+        )
+    })?;
+    conn.create_module(sql_name, eponymous_only_module::<ShimVTab>(), Some(def))
+}
+
+#[repr(C)]
+struct ShimVTab {
+    /// Base class — must be first (sqlite3_vtab ABI requirement).
+    base: ffi::sqlite3_vtab,
+    /// Shim def for this UDTF. Cloned from the module's Aux on
+    /// each connect (one connect per `SELECT FROM udtf(...)`).
+    def: Arc<dyn TableFunctionDef>,
+    /// Output column count (used by best_index to skip those
+    /// constraints — only input-arg constraints route to filter).
+    n_output: usize,
+    /// Input arg count (used by best_index + filter to size argv).
+    n_input: usize,
+}
+
+unsafe impl<'vtab> VTab<'vtab> for ShimVTab {
+    type Aux = Arc<dyn TableFunctionDef>;
+    type Cursor = ShimVTabCursor;
+
+    fn connect(
+        db: &mut VTabConnection,
+        aux: Option<&Self::Aux>,
+        _args: &[&[u8]],
+    ) -> Result<(String, ShimVTab)> {
+        let def = aux.cloned().ok_or_else(|| rusqlite::Error::UserFunctionError(
+            "ShimVTab::connect: aux missing".into()
+        ))?;
+
+        // Output schema: ask the def what columns it will emit
+        // given its first param signature's types. Most shim UDTFs
+        // have a stable output schema; for those that branch on
+        // input types, this assumes the first signature is the
+        // canonical one.
+        let first_sig = def.param_types().into_iter().next().unwrap_or_default();
+        let output_cols = def.output_schema(&first_sig);
+        let n_output = output_cols.len();
+        let n_input = first_sig.len();
+
+        let mut schema = String::from("CREATE TABLE x(");
+        for (i, col) in output_cols.iter().enumerate() {
+            if i > 0 { schema.push_str(", "); }
+            // Quote the column name and assign a SQLite affinity
+            // based on the shim's DataType.
+            schema.push_str(&format!(
+                "\"{}\" {}",
+                col.name.replace('"', "\"\""),
+                datatype_to_affinity(&col.data_type)
+            ));
+        }
+        for i in 0..n_input {
+            if !output_cols.is_empty() || i > 0 { schema.push_str(", "); }
+            schema.push_str(&format!("\"arg{i}\" BLOB HIDDEN"));
+        }
+        schema.push(')');
+
+        // INNOCUOUS allows the vtable to be used from triggers /
+        // views without elevated permission.
+        db.config(VTabConfig::Innocuous)?;
+
+        Ok((schema, ShimVTab {
+            base: ffi::sqlite3_vtab::default(),
+            def,
+            n_output,
+            n_input,
+        }))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> Result<()> {
+        // Walk every constraint. The input args are at columns
+        // [n_output .. n_output+n_input). Mark each EQ constraint
+        // on those as required-for-filter so SQLite hands the
+        // value to filter() via argv.
+        //
+        // Two-pass to avoid the borrow conflict on info: collect
+        // matching constraint indices first, then mutate usage.
+        let usable_arg_constraints: Vec<usize> = info.constraints()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                if !c.is_usable() { return None; }
+                let col = c.column() as usize;
+                if col < self.n_output { return None; }
+                if c.operator() != IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ { return None; }
+                Some(i)
+            })
+            .collect();
+        for (rank, i) in usable_arg_constraints.iter().enumerate() {
+            let mut usage = info.constraint_usage(*i);
+            usage.set_argv_index((rank + 1) as std::os::raw::c_int);
+            usage.set_omit(true);
+        }
+        // Estimated cost: arbitrary low value so the planner
+        // prefers our vtable over re-evaluating per row.
+        info.set_estimated_cost(1.0);
+        Ok(())
+    }
+
+    fn open(&'vtab mut self) -> Result<Self::Cursor> {
+        Ok(ShimVTabCursor {
+            base: ffi::sqlite3_vtab_cursor::default(),
+            def: Arc::clone(&self.def),
+            iter: None,
+            current: None,
+            rowid: 0,
+            done: true,  // true until filter() loads an iter
+        })
+    }
+}
+
+/// SQLite cursor over the rows yielded by the shim's
+/// TableFunctionIterator. Caches the current row so column()
+/// can read it without re-driving the iterator.
+#[repr(C)]
+struct ShimVTabCursor {
+    /// Base class — must be first.
+    base: ffi::sqlite3_vtab_cursor,
+    def: Arc<dyn TableFunctionDef>,
+    iter: Option<Box<dyn TableFunctionIterator>>,
+    current: Option<TableRow>,
+    rowid: i64,
+    done: bool,
+}
+
+impl ShimVTabCursor {
+    fn advance(&mut self) -> Result<()> {
+        let iter = match &mut self.iter {
+            Some(i) => i,
+            None => { self.done = true; return Ok(()); }
+        };
+        match iter.next_row() {
+            Some(Ok(row)) => {
+                self.current = Some(row);
+                self.rowid += 1;
+                self.done = false;
+            }
+            Some(Err(e)) => {
+                return Err(rusqlite::Error::UserFunctionError(Box::new(
+                    std::io::Error::other(format!("{e:?}"))
+                )));
+            }
+            None => {
+                self.current = None;
+                self.done = true;
+            }
+        }
+        Ok(())
+    }
+}
+
+unsafe impl VTabCursor for ShimVTabCursor {
+    fn filter(
+        &mut self,
+        _idx_num: std::os::raw::c_int,
+        _idx_str: Option<&str>,
+        args: &Values<'_>,
+    ) -> Result<()> {
+        // Build FunctionValue args from the SQLite Values handed
+        // by best_index. argv order matches our set_argv_index
+        // assignment, which iterates constraints in column order
+        // — so args[0] is arg0, args[1] is arg1, etc.
+        let mut fv_args: Vec<FunctionValue> = Vec::with_capacity(args.len());
+        for v in args {
+            fv_args.push(value_ref_to_function_value(v));
+        }
+
+        let iter = self.def.execute(&fv_args).map_err(|e| {
+            rusqlite::Error::UserFunctionError(Box::new(
+                std::io::Error::other(format!("{e:?}"))
+            ))
+        })?;
+        self.iter = Some(iter);
+        self.current = None;
+        self.rowid = 0;
+        self.done = false;
+        self.advance()
+    }
+
+    fn next(&mut self) -> Result<()> {
+        self.advance()
+    }
+
+    fn eof(&self) -> bool {
+        self.done
+    }
+
+    fn column(&self, ctx: &mut Context, i: std::os::raw::c_int) -> Result<()> {
+        let i = i as usize;
+        let row = self.current.as_ref().ok_or_else(|| {
+            rusqlite::Error::UserFunctionError(
+                "ShimVTabCursor::column called with no current row".into()
+            )
+        })?;
+        let value = row.values.get(i).cloned().unwrap_or(FunctionValue::Null);
+        let out = function_value_to_tosql(value);
+        ctx.set_result(&out)
+    }
+
+    fn rowid(&self) -> Result<i64> {
+        Ok(self.rowid)
+    }
+}
+
+/// Map shim DataType → SQLite type affinity string. The
+/// returned string ends up in CREATE TABLE so SQLite uses it
+/// to pick storage class. Affinities are advisory in SQLite
+/// (all columns can hold any value); the values that flow
+/// through column() are already correctly typed.
+fn datatype_to_affinity(dt: &datafission_types::DataType) -> &'static str {
+    use datafission_types::DataType as D;
+    match dt {
+        D::Boolean | D::Int8 | D::Int16 | D::Int32 | D::Int64
+        | D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64
+            => "INTEGER",
+        D::Float32 | D::Float64 => "REAL",
+        D::Text | D::Char { .. } | D::Varchar { .. } => "TEXT",
+        D::Binary => "BLOB",
+        _ => "BLOB",  // arrays / structs / extensions all blob-shaped
+    }
+}
+"##,
+    );
     s
 }
 
