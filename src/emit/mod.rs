@@ -792,22 +792,70 @@ pub fn types_rs(plan: &BridgePlan) -> String {
 
 pub fn operators_rs(plan: &BridgePlan) -> String {
     let mut s = generated_header();
-    s.push_str(r##"//! Operator handling.
+    s.push_str(
+r##"//! Operator handling.
 //!
-//! SQLite has NO custom operators. The bridge handles `a && b`,
-//! `a <-> b`, etc. by registering a parser-rewrite shim that
-//! turns each `lhs OP rhs` into `op_<symbol>(lhs, rhs)`. The
-//! function `op_<symbol>` is registered as a regular scalar in
-//! scalars.rs.
+//! ## Phase 4d — ARCHITECTURALLY BLOCKED for a loadable
+//! extension (2026-06-24)
 //!
-//! For the host this means: either intercept queries via a
-//! preprocessor (sqlink's wrapper sees the SQL text before
-//! SQLite does), or document that users must write the function
-//! form themselves. The first option is preferred when
-//! available.
+//! Operators like `g1 && g2` and `g1 <-> g2` are PARSER-LEVEL
+//! tokens in PostgreSQL. SQLite's parser does not recognise
+//! them — `SELECT g1 && g2` is a syntax error BEFORE any
+//! function dispatch could intervene. There is no SQLite C
+//! API to register a custom operator token.
+//!
+//! Loadable extensions cannot fix this. The bridge can register
+//! a normal scalar function under any name, but the SQL parser
+//! is fixed.
+//!
+//! ## Where this work actually lives
+//!
+//! Operator/cast/preprocessor support is a SQL-PREPROCESSING
+//! concern, not an extension concern. The proper home is a
+//! separate `sqlink-preprocess` crate that:
+//!
+//!   - Parses the SQL surface (via sqlparser-rs)
+//!   - Rewrites operators: `g1 && g2` → `st_bboxintersects(g1, g2)`
+//!   - Rewrites casts:     `CAST(x AS GEOMETRY)` → `st_geomfromtext(x)`
+//!     when x is a string literal
+//!   - Hands the rewritten SQL to rusqlite's `prepare`/`execute`
+//!
+//! That crate doesn't ship as a SQLite extension — it's a host-
+//! side library users wrap their SQL with. It can absolutely be
+//! generated from the same `BridgePlan` this crate emits, but
+//! it's a separate target crate.
+//!
+//! ## The bridge-side compromise
+//!
+//! For users who don't want to wrap their SQL, the bridge could
+//! register the operator NAMES as regular scalars under encoded
+//! names:
+//!
+//!   register_scalar("op_amp_amp",   ...) → st_bboxintersects
+//!   register_scalar("op_arrow",     ...) → st_knndistance
+//!   register_scalar("op_at_gt",     ...) → st_contains
+//!
+//! Users write `op_amp_amp(g1, g2)` instead of `g1 && g2`. It
+//! works (a function with that name is fine in SQLite) but it's
+//! syntactically ugly. Not currently emitted — flip on by
+//! removing the early return below.
+
+use rusqlite::{Connection, Result};
+
+pub fn register_all(_conn: &Connection) -> Result<()> {
+    // Bridge-side compromise (op_<encoded>(args)) is deliberately
+    // off by default. The proper home is sqlink-preprocess (a
+    // separate sibling crate that wraps SQL before execute).
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Operators the shim advertises.
+// ----------------------------------------------------------------------
 
 "##);
     for ext in &plan.extensions {
+        s.push_str(&format!("// === extension: {} ===\n", ext.name));
         for op in &ext.operators {
             s.push_str(&format!(
                 "// `{}` (lhs={:?}, rhs={:?})  →  {}\n",
@@ -815,27 +863,38 @@ pub fn operators_rs(plan: &BridgePlan) -> String {
             ));
         }
     }
-    s.push_str("\n// TODO: build the operator → function rewrite table\n\
-                 //       and feed it to sqlink's parser-preprocessor hook.\n");
     s
 }
 
 pub fn casts_rs(plan: &BridgePlan) -> String {
     let mut s = generated_header();
-    s.push_str(r##"//! CAST(x AS T) rewrites.
+    s.push_str(
+r##"//! CAST(x AS T) rewrites.
 //!
-//! `source_kind` tells the rewriter when to fire:
-//!   - "any"             — always
-//!   - "stringliteral"   — only literal strings
-//!   - "geographycolumn" — only when x has geography column type
+//! ## Phase 4d — same blocker as operators.
 //!
-//! SQLite's CAST() doesn't natively understand custom types, so
-//! the bridge rewrites `CAST(x AS GEOMETRY)` into
-//! `ST_GeomFromText(x)` (or the appropriate function for the
-//! source kind).
+//! SQLite's `CAST(x AS GEOMETRY)` is parser-level — the type
+//! name is consumed as a built-in token and converted at parse
+//! time. There is no hook for a custom-type CAST. We cannot
+//! rewrite `CAST(x AS GEOMETRY)` → `st_geomfromtext(x)` from
+//! inside a loadable extension; the parse fails first.
+//!
+//! The proper home for cast rewrites is the same separate
+//! `sqlink-preprocess` crate documented in operators.rs.
+
+use rusqlite::{Connection, Result};
+
+pub fn register_all(_conn: &Connection) -> Result<()> {
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Cast rewrites the shim advertises.
+// ----------------------------------------------------------------------
 
 "##);
     for ext in &plan.extensions {
+        s.push_str(&format!("// === extension: {} ===\n", ext.name));
         for c in &ext.cast_rewrites {
             s.push_str(&format!(
                 "// CAST(<{}> AS {}) → {} (hint: {})\n",
@@ -843,22 +902,39 @@ pub fn casts_rs(plan: &BridgePlan) -> String {
             ));
         }
     }
-    s.push_str("\n// TODO: register CAST-rewrite rules in sqlink's preprocessor.\n");
     s
 }
 
 pub fn preprocessors_rs(plan: &BridgePlan) -> String {
     let mut s = generated_header();
-    s.push_str(r##"//! SQL preprocessor patterns — token-level rewrites the shim
+    s.push_str(
+r##"//! SQL preprocessor patterns — token-level rewrites the shim
 //! advertises (e.g. PostGIS's EWKT-shorthand prefix-arrow).
+//!
+//! ## Phase 4d — same blocker as operators / casts.
+//!
+//! Token-level rewrites are by definition a parser concern.
+//! They cannot be implemented inside a loadable extension. See
+//! operators.rs for the architectural picture and the
+//! `sqlink-preprocess` proposal.
+
+use rusqlite::{Connection, Result};
+
+pub fn register_all(_conn: &Connection) -> Result<()> {
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Preprocessor patterns the shim advertises.
+// ----------------------------------------------------------------------
 
 "##);
     for ext in &plan.extensions {
+        s.push_str(&format!("// === extension: {} ===\n", ext.name));
         for p in &ext.preprocessor_patterns {
             s.push_str(&format!("// token `{}` → {}\n", p.op_token, p.function_name));
         }
     }
-    s.push_str("\n// TODO: emit the preprocessor rewrite table.\n");
     s
 }
 
