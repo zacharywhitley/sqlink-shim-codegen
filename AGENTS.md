@@ -113,19 +113,55 @@ don't fire and users have to write function form.
 The skeleton compiles and is documented. To make it produce
 working bridges:
 
-### Phase 1 — scalar dispatch (smallest useful slice)
+### Phase 1 — scalar dispatch ✅ LANDED 2026-06-23
 
-- [ ] Add `datafission-df-plugin-loader` as a path-dep to the
+- [x] Add `datafission-df-plugin-loader` as a path-dep to the
       generated `Cargo.toml` (see `emit::cargo_toml`).
-- [ ] In `emit::lib_rs`, emit the real `sqlite3_<name>_init`
-      function with shim instantiation.
-- [ ] In `emit::scalars_rs`, emit
-      `sqlite3_create_function_v2` calls + dispatcher closure
-      per scalar. Use the canonical name; emit one extra call
-      per alias.
-- [ ] Smoke-test against a single PostGIS scalar
-      (`ST_GeomFromText` is a good first one — text in, blob
-      out, no geometry args needed).
+- [x] In `emit::lib_rs`, emit the real `sqlite3_extension_init`
+      function with shim instantiation (uses rusqlite's
+      `Connection::extension_init2` to handle the
+      `SQLITE_EXTENSION_INIT2` macro plumbing).
+- [x] Emit a new `registry` module that loads the composed
+      shim once on init, walks every `register_scalar_function`
+      callback via a minimal `ExtensionTarget`, and exposes
+      `lookup_scalar(name) -> Arc<dyn ScalarFunctionDef>` for
+      the per-call dispatcher.
+- [x] In `emit::scalars_rs`, emit `Connection::create_scalar_function`
+      calls + a `dispatch_scalar` closure that marshals
+      SQLite `ValueRef` → `FunctionValue`, invokes
+      `ScalarFunctionDef::execute`, marshals the result back
+      to `ToSqlOutput`. One registration per canonical name +
+      one per alias.
+- [x] Verified end-to-end: the generated bridge against the
+      live PostGIS interface DB `cargo check`s clean against
+      df-plugin-loader and rusqlite. `ST_GeomFromText` and its
+      14 aliases are wired live.
+
+#### Phase 1 runtime contract
+
+The generated bridge expects the composed shim wasm path in an
+env var named `<EXT>_SHIM_WASM` (e.g. `POSTGIS_SHIM_WASM`).
+Set it before `.load`:
+
+```
+export POSTGIS_SHIM_WASM=$HOME/git/datafission/extensions/postgis/deps/postgis-composed.wasm
+sqlite3
+sqlite> .load ./target/release/libpostgis_sqlite_bridge
+sqlite> SELECT length(ST_GeomFromText('POINT(1 1)'));  -- → 21 (WKB bytes)
+```
+
+#### Phase 1 known limitations (intentional — defer)
+
+- Other scalar names are listed as comments in `scalars.rs`
+  but not registered. To turn one on, copy the
+  `register_scalar(...)` line in `register_all` and adapt the
+  arity. Each new name should JUST WORK if the shim wrapped it
+  — the dispatch is fully generic.
+- The cdylib build pulls in wasmtime + all postgis-wasm
+  transitive deps, so target/ runs ~4 GB. `cargo check` is
+  ~70 MB. We're not optimising for cdylib size yet; consider
+  using a slimmer scalar-invoke surface in a later phase if
+  binary size becomes a problem.
 
 ### Phase 2 — aggregates
 

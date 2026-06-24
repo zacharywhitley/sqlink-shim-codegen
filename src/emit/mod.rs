@@ -19,14 +19,37 @@ description = "Generated SQLite extension that bridges the {name} DataFission sh
 license = "Apache-2.0"
 
 [lib]
-crate-type = ["cdylib"]
+# `cdylib` is the loadable-extension shape SQLite's `.load`
+# expects. `lib` is kept so the inner modules are also
+# unit-testable.
+name = "{name}_sqlite_bridge"
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# TODO: depend on the DataFission df-plugin-loader (path or git)
-#       so the bridge can host the wasm shim at runtime.
-# datafission-df-plugin-loader = {{ path = "../datafission/crates/df-plugin-loader" }}
-# rusqlite = {{ version = "0.32", features = ["bundled", "loadable_extension"] }}
-# anyhow = "1"
+# Path-deps into the source DataFission tree so we can call
+# the loader's wasm scalar-invoke surface directly. Move to
+# git-deps when DataFission ships releases.
+datafission-df-plugin-loader = {{ path = "../datafission/crates/df-plugin-loader" }}
+datafission-df-plugin-api    = {{ path = "../datafission/crates/df-plugin-api" }}
+datafission-functions        = {{ path = "../datafission/crates/functions" }}
+
+# rusqlite's `loadable_extension` feature provides the
+# `Connection::extension_init2` entry-point helper; no
+# bundled libsqlite (the extension links against the host
+# SQLite at load time).
+rusqlite = {{ version = "0.32", features = ["loadable_extension", "functions"] }}
+
+anyhow     = "1"
+once_cell  = "1"
+parking_lot = "0.12"
+tracing    = "0.1"
+serde_json = "1"
+
+[profile.release]
+lto         = true
+codegen-units = 1
+opt-level   = "z"
+strip       = true
 "##,
         name = crate_name,
     )
@@ -39,36 +62,73 @@ pub fn lib_rs(plan: &BridgePlan) -> String {
     s.push_str(
 r##"//! Generated SQLite extension entry point.
 //!
-//! Load with `.load ./target/release/lib<name>_sqlite_bridge`.
+//! Load with:
+//!   sqlite> .load ./target/release/lib<ext>_sqlite_bridge
+//!
+//! Phase 1 (2026-06-23): scalar dispatch wired through
+//! df-plugin-loader. ST_GeomFromText is fully functional; the
+//! other categories (aggregates, UDTFs, window funcs, types,
+//! operators, casts, preprocessors, system catalog, spatial
+//! indexes) are scaffold-only — see per-module TODOs and
+//! AGENTS.md for the phased plan.
 
-mod scalars;
-mod aggregates;
-mod table_functions;
-mod window_functions;
-mod types;
-mod operators;
-mod casts;
-mod preprocessors;
-mod system_catalog;
-mod spatial_indexes;
+pub mod registry;
+pub mod scalars;
+pub mod aggregates;
+pub mod table_functions;
+pub mod window_functions;
+pub mod types;
+pub mod operators;
+pub mod casts;
+pub mod preprocessors;
+pub mod system_catalog;
+pub mod spatial_indexes;
 
-// TODO: wire up sqlite3_extension_init.
-//
-// The expected shape (see https://www.sqlite.org/loadext.html):
-//
-//   #[no_mangle]
-//   pub extern "C" fn sqlite3_<name>_init(
-//       db: *mut sqlite3,
-//       err_msg: *mut *mut c_char,
-//       api: *const sqlite3_api_routines,
-//   ) -> c_int {
-//       sqlite3_api = api;
-//       // 1. Instantiate the wasm shim via df-plugin-loader.
-//       // 2. Call scalars::register_all(db, &ext)?
-//       // 3. Call aggregates::register_all(db, &ext)?
-//       // ...
-//       SQLITE_OK
-//   }
+use std::os::raw::{c_char, c_int};
+
+use rusqlite::ffi;
+use rusqlite::{Connection, Result};
+
+/// SQLite extension entry point. Loaded by SQLite when the
+/// user runs `.load`. rusqlite's `extension_init2` wraps the
+/// `SQLITE_EXTENSION_INIT2` macro: it stashes the api routines
+/// pointer and hands us a safe `Connection`.
+///
+/// Symbol name must be `sqlite3_extension_init` for the
+/// default `.load` behavior (no explicit init-function name).
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_extension_init(
+    db: *mut ffi::sqlite3,
+    pz_err_msg: *mut *mut c_char,
+    p_api: *mut ffi::sqlite3_api_routines,
+) -> c_int {
+    Connection::extension_init2(db, pz_err_msg, p_api, init_inner)
+}
+
+fn init_inner(conn: Connection) -> Result<bool> {
+    // Load the composed shim wasm exactly once. The path comes
+    // from `<EXT>_SHIM_WASM` env var so the bridge isn't pinned
+    // to a build-time path (matches the host's runtime-loaded
+    // model).
+    registry::load_shim().map_err(|e| {
+        rusqlite::Error::UserFunctionError(
+            format!("shim load: {e}").into()
+        )
+    })?;
+
+    // Register Phase-1 scalars.
+    scalars::register_all(&conn)
+        .map_err(|e| rusqlite::Error::UserFunctionError(
+            format!("scalar registration: {e}").into()
+        ))?;
+
+    // Returning `true` means "extension fully initialized — no
+    // need to keep it loaded across DB sessions". `false` would
+    // ask SQLite to auto-load on every new connection in the
+    // process.
+    Ok(true)
+}
 
 "##,
     );
@@ -94,25 +154,179 @@ mod spatial_indexes;
 
 pub fn scalars_rs(plan: &BridgePlan) -> String {
     let mut s = generated_header();
-    s.push_str(r##"//! Scalar-function registration.
+    s.push_str(
+r##"//! Scalar-function registration.
 //!
-//! For each scalar, we want to call:
+//! Phase 1 (2026-06-23): the architecture is wired up and
+//! ST_GeomFromText is fully functional. Other scalars are
+//! listed below as comments; per-name registration follows
+//! identically once you uncomment + adapt the dispatcher.
 //!
-//!   sqlite3_create_function_v2(
-//!     db, "name", arg_count, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
-//!     user_data_ptr,  // boxed dispatch closure
-//!     dispatch_fn,    // pulls args, builds 1-row batch, calls shim
-//!     null,           // step
-//!     null,           // final
-//!     destroy_fn);    // drops the boxed closure
-//!
-//! See AGENTS.md → "How a scalar is dispatched at runtime" for
-//! the call shape.
+//! Dispatch shape: each SQLite scalar call pulls args from
+//! `rusqlite::functions::Context`, maps them to
+//! `datafission_functions::types::FunctionValue`, calls the
+//! shim's `ScalarFunctionDef::execute`, and maps the result
+//! back to a `rusqlite::types::ToSqlOutput`.
 
-"##);
+use std::sync::Arc;
+
+use rusqlite::functions::{Context, FunctionFlags};
+use rusqlite::types::{ToSqlOutput, Value, ValueRef};
+use rusqlite::{Connection, Result};
+
+use datafission_functions::traits::ScalarFunctionDef;
+use datafission_functions::types::FunctionValue;
+
+use crate::registry;
+
+/// Register every Phase-1 scalar against the given connection.
+pub fn register_all(conn: &Connection) -> Result<()> {
+"##,
+    );
+
+    let mut emitted = 0;
+    for ext in &plan.extensions {
+        for sc in &ext.scalars {
+            // Phase 1: only ST_GeomFromText is wired live. The
+            // rest are commented out (with arity / aliases) so a
+            // future phase can flip them on without re-running the
+            // codegen.
+            let is_phase1 = sc.canonical_name == "st_geomfromtext";
+            if is_phase1 {
+                let nargs = sc.param_signatures.first().map(|v| v.len()).unwrap_or(1) as i32;
+                let det = if sc.is_deterministic { "SQLITE_DETERMINISTIC" } else { "0u32.into()" };
+                s.push_str(&format!(
+                    "    register_scalar(conn, \"{name}\", {nargs}, {det})?;\n",
+                    name = sc.canonical_name,
+                    nargs = nargs,
+                    det = if sc.is_deterministic {
+                        "FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_UTF8"
+                    } else {
+                        "FunctionFlags::SQLITE_UTF8"
+                    },
+                ));
+                for alias in &sc.aliases {
+                    s.push_str(&format!(
+                        "    register_scalar(conn, \"{alias}\", {nargs}, {det})?; // alias of {name}\n",
+                        alias = alias, nargs = nargs,
+                        det = if sc.is_deterministic {
+                            "FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_UTF8"
+                        } else {
+                            "FunctionFlags::SQLITE_UTF8"
+                        },
+                        name = sc.canonical_name,
+                    ));
+                }
+                emitted += 1;
+            }
+        }
+    }
+    if emitted == 0 {
+        s.push_str("    // No Phase-1 scalars matched in this interface DB.\n");
+    }
+
+    s.push_str(
+r##"    Ok(())
+}
+
+/// Register one scalar by name. The shim's registry is looked
+/// up at dispatch time so each `name` resolves to the same
+/// `Arc<dyn ScalarFunctionDef>` the shim handed us at load.
+fn register_scalar(
+    conn: &Connection,
+    sql_name: &str,
+    arity: i32,
+    flags: FunctionFlags,
+) -> Result<()> {
+    // Resolve once at registration time. If the shim doesn't
+    // know this name, fail fast rather than at first call.
+    let def: Arc<dyn ScalarFunctionDef> = registry::lookup_scalar(sql_name)
+        .ok_or_else(|| rusqlite::Error::UserFunctionError(
+            format!("scalar `{sql_name}` not registered by the shim").into()
+        ))?;
+
+    conn.create_scalar_function(sql_name, arity, flags, move |ctx| -> Result<ToSqlOutput<'static>> {
+        dispatch_scalar(&def, ctx)
+    })
+}
+
+/// Per-call dispatcher: marshal sqlite args → FunctionValue,
+/// invoke the shim's ScalarFunctionDef, marshal the result back.
+///
+/// Returns an owned `ToSqlOutput<'static>` because every
+/// `FunctionValue` variant we map produces an owned `Value`.
+fn dispatch_scalar<'a>(
+    def: &Arc<dyn ScalarFunctionDef>,
+    ctx: &Context<'a>,
+) -> Result<ToSqlOutput<'static>> {
+    let n = ctx.len();
+    let mut args = Vec::with_capacity(n);
+    for i in 0..n {
+        let v = ctx.get_raw(i);
+        args.push(value_ref_to_function_value(v));
+    }
+    let result = def.execute(&args).map_err(|e| {
+        rusqlite::Error::UserFunctionError(Box::new(std::io::Error::other(format!("{e:?}"))))
+    })?;
+    Ok(function_value_to_tosql(result))
+}
+
+/// SQLite ValueRef → FunctionValue. Null/Real/Integer/Text/Blob
+/// map 1:1; nothing else is reachable through SQLite's value
+/// system.
+fn value_ref_to_function_value(v: ValueRef<'_>) -> FunctionValue {
+    match v {
+        ValueRef::Null => FunctionValue::Null,
+        ValueRef::Integer(i) => FunctionValue::Int64(i),
+        ValueRef::Real(f) => FunctionValue::Float64(f),
+        ValueRef::Text(b) => FunctionValue::String(
+            String::from_utf8_lossy(b).into_owned()
+        ),
+        ValueRef::Blob(b) => FunctionValue::Binary(b.to_vec()),
+    }
+}
+
+/// FunctionValue → ToSqlOutput. Owned variants only — the
+/// SQLite layer will copy, so we don't try to borrow.
+fn function_value_to_tosql(v: FunctionValue) -> ToSqlOutput<'static> {
+    let value = match v {
+        FunctionValue::Null => Value::Null,
+        FunctionValue::Boolean(b) => Value::Integer(b as i64),
+        FunctionValue::Int8(i) => Value::Integer(i as i64),
+        FunctionValue::Int16(i) => Value::Integer(i as i64),
+        FunctionValue::Int32(i) => Value::Integer(i as i64),
+        FunctionValue::Int64(i) => Value::Integer(i),
+        FunctionValue::UInt8(i) => Value::Integer(i as i64),
+        FunctionValue::UInt16(i) => Value::Integer(i as i64),
+        FunctionValue::UInt32(i) => Value::Integer(i as i64),
+        FunctionValue::UInt64(i) => Value::Integer(i as i64),
+        FunctionValue::Float32(f) => Value::Real(f as f64),
+        FunctionValue::Float64(f) => Value::Real(f),
+        FunctionValue::String(s) => Value::Text(s),
+        FunctionValue::Binary(b) => Value::Blob(b),
+        // Array / Map / Struct don't have a canonical SQLite
+        // representation. Serialize as JSON text for now —
+        // callers can ROUND_TRIP through json_extract.
+        other => Value::Text(
+            serde_json::to_string(&other).unwrap_or_else(|_| "<unrepresentable>".into())
+        ),
+    };
+    ToSqlOutput::Owned(value)
+}
+
+// ----------------------------------------------------------------------
+// Comment block: every scalar in this interface DB. Uncomment
+// the matching `register_scalar(...)` call in `register_all`
+// above to enable a name in a future phase.
+// ----------------------------------------------------------------------
+
+"##,
+    );
+
     for ext in &plan.extensions {
         s.push_str(&format!("// === extension: {} ===\n", ext.name));
         for sc in &ext.scalars {
+            if sc.canonical_name == "st_geomfromtext" { continue; }
             let nargs = sc.param_signatures.first().map(|v| v.len()).unwrap_or(0);
             s.push_str(&format!(
                 "// scalar `{}` (deterministic={}, propagates_null={}, arity={}, return={})\n",
@@ -124,13 +338,141 @@ pub fn scalars_rs(plan: &BridgePlan) -> String {
         }
         s.push('\n');
     }
-    s.push_str(
-r##"// TODO: actually emit registration calls. The data above is
-// what every scalar needs; the per-target binding is
-// sqlite3_create_function_v2. The dispatcher closure follows
-// the "1-row batch" model in AGENTS.md.
-"##,
+    s
+}
+
+pub fn registry_rs(plan: &BridgePlan) -> String {
+    let mut s = generated_header();
+    let env_var = format!(
+        "{}_SHIM_WASM",
+        primary_extension_name(plan).to_uppercase().replace('-', "_")
     );
+    s.push_str(&format!(
+r##"//! Shim registry — loads the composed wasm shim exactly once
+//! at extension-init time and exposes a name → ScalarFunctionDef
+//! lookup for the per-call dispatcher.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use anyhow::{{Context, Result}};
+use once_cell::sync::OnceCell;
+use parking_lot::RwLock;
+
+use datafission_df_plugin_api::{{
+    DataTypePlugin, Extension, ExtensionError, ExtensionTarget, SystemCatalogProvider,
+}};
+use datafission_df_plugin_loader::RuntimeWasmExtension;
+use datafission_functions::traits::{{
+    AggregateFunctionDef, ScalarFunctionDef, TableFunctionDef, WindowFunctionDef,
+}};
+
+/// Lazily-loaded shim handle. Initialised in `load_shim()` from
+/// the `{env}` env var.
+static SHIM: OnceCell<ShimRegistry> = OnceCell::new();
+
+struct ShimRegistry {{
+    _ext: RuntimeWasmExtension,  // keep the wasm Store alive
+    scalars: RwLock<HashMap<String, Arc<dyn ScalarFunctionDef>>>,
+}}
+
+pub fn load_shim() -> Result<()> {{
+    if SHIM.get().is_some() {{
+        return Ok(());
+    }}
+    let path = std::env::var("{env}")
+        .with_context(|| format!(
+            "Set {env}=/path/to/composed-shim.wasm before .load"
+        ))?;
+    let ext = RuntimeWasmExtension::from_file(&path)
+        .with_context(|| format!("loading shim {{path}}"))?;
+
+    let mut capture = CapturingTarget {{
+        scalars: Vec::new(),
+    }};
+    ext.register(&mut capture)
+        .map_err(|e| anyhow::anyhow!("shim register: {{e}}"))?;
+
+    let mut scalars = HashMap::with_capacity(capture.scalars.len() * 2);
+    for def in capture.scalars {{
+        let canonical = def.name().to_string();
+        for alias in def.aliases() {{
+            scalars.insert(alias.to_string(), Arc::clone(&def));
+        }}
+        scalars.insert(canonical, def);
+    }}
+
+    SHIM.set(ShimRegistry {{
+        _ext: ext,
+        scalars: RwLock::new(scalars),
+    }}).map_err(|_| anyhow::anyhow!("ShimRegistry already initialised"))?;
+
+    Ok(())
+}}
+
+pub fn lookup_scalar(name: &str) -> Option<Arc<dyn ScalarFunctionDef>> {{
+    let r = SHIM.get()?;
+    r.scalars.read().get(name).cloned()
+}}
+
+/// Minimal ExtensionTarget that just collects every scalar the
+/// shim registers. We ignore other categories in Phase 1 —
+/// later phases extend this to capture aggregates / UDTFs /
+/// window functions / types / system catalog / spatial indexes
+/// in parallel maps.
+struct CapturingTarget {{
+    scalars: Vec<Arc<dyn ScalarFunctionDef>>,
+}}
+
+impl ExtensionTarget for CapturingTarget {{
+    fn register_scalar_function(
+        &mut self,
+        _namespace: &str,
+        def: Arc<dyn ScalarFunctionDef>,
+    ) -> std::result::Result<(), ExtensionError> {{
+        self.scalars.push(def);
+        Ok(())
+    }}
+    fn register_aggregate_function(
+        &mut self,
+        _namespace: &str,
+        _def: Arc<dyn AggregateFunctionDef>,
+    ) -> std::result::Result<(), ExtensionError> {{
+        Ok(())
+    }}
+    fn register_table_function(
+        &mut self,
+        _namespace: &str,
+        _def: Arc<dyn TableFunctionDef>,
+    ) -> std::result::Result<(), ExtensionError> {{
+        Ok(())
+    }}
+    fn register_window_function(
+        &mut self,
+        _namespace: &str,
+        _def: Arc<dyn WindowFunctionDef>,
+    ) -> std::result::Result<(), ExtensionError> {{
+        Ok(())
+    }}
+    fn register_data_type(
+        &mut self,
+        _plugin: Arc<dyn DataTypePlugin>,
+    ) -> std::result::Result<(), ExtensionError> {{
+        Ok(())
+    }}
+    fn register_system_catalog_provider(
+        &mut self,
+        _provider: Arc<dyn SystemCatalogProvider>,
+    ) -> std::result::Result<(), ExtensionError> {{
+        Ok(())
+    }}
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {{
+        self
+    }}
+}}
+"##,
+        env = env_var,
+    ));
     s
 }
 
