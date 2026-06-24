@@ -1249,11 +1249,24 @@ r##"//! Spatial index registration.
 }
 
 pub fn readme(plan: &BridgePlan) -> String {
+    let primary = primary_extension_name(plan);
+    let crate_name = sanitize_crate_name(&primary);
+    let shim_env = format!("{}_SHIM_WASM", primary.to_uppercase().replace('-', "_"));
+    let lib_name = format!("lib{}_sqlite_bridge.dylib", crate_name.replace('-', "_"));
+
     let mut s = String::new();
-    s.push_str("# Generated SQLite bridge\n\n");
-    s.push_str("This crate was produced by `sqlink-shim-codegen`. Do not edit\n");
-    s.push_str("by hand — regenerate from the source `.sqlite`.\n\n");
-    s.push_str("## Extensions wrapped\n\n");
+    s.push_str(&format!("# {primary}-sqlite-bridge\n\n"));
+    s.push_str(&format!(
+        "Generated SQLite loadable extension that bridges the **{primary}** DataFission \
+         wasm shim into SQLite as native scalar functions, aggregates, and UDTFs via \
+         rusqlite's `create_scalar_function` / `create_aggregate_function` / `VTab` \
+         traits.\n\n"
+    ));
+    s.push_str("Produced by [`sqlink-shim-codegen`](https://github.com/zacharywhitley/sqlink-shim-codegen) \
+                from a shim-interface SQLite database. **Do not edit by hand** — regenerate \
+                from the source.\n\n");
+
+    s.push_str("## Surface\n\n");
     s.push_str(
         "| Extension | Version | Scalars | Aggregates | UDTFs | Windows | Types | \
          Operators | Casts | Preprocessors | Catalog | Indexes |\n",
@@ -1275,6 +1288,66 @@ pub fn readme(plan: &BridgePlan) -> String {
             e.spatial_indexes.len(),
         ));
     }
+
+    s.push_str(&format!(
+r##"
+## Build
+
+```sh
+cargo build --release
+```
+
+The build needs sibling checkouts of the path-dep'd workspace
+crates (`datafission-df-plugin-loader`, `datafission-df-plugin-api`,
+`datafission-functions`) at `../datafission/crates/`.
+
+## Load + use
+
+The bridge needs the composed shim wasm at runtime; set
+`{shim_env}` before `.load`:
+
+```sh
+{shim_env}=/path/to/{primary}-composed.wasm \
+  sqlite3 -cmd ".load target/release/{lib_name}" :memory:
+```
+
+**macOS gotcha**: the system `/usr/bin/sqlite3` is compiled
+with `-DSQLITE_OMIT_LOAD_EXTENSION` and refuses `.load`. Use
+homebrew sqlite (`/opt/homebrew/Cellar/sqlite/<ver>/bin/sqlite3`)
+or any distro sqlite that ships extension support.
+
+## Regen
+
+When the upstream shim's SQL surface changes:
+
+```sh
+cd ~/git/sqlink-shim-codegen
+cargo run --release -- \
+  --interface /path/to/{primary}-interface.sqlite \
+  --out ~/git/{primary}-sqlite-bridge
+```
+
+The codegen pipes every emitted `.rs` through
+`rustfmt --edition 2021`, so the resulting crate is
+`cargo fmt -p {crate_name}-sqlite-bridge -- --check`-clean by
+construction.
+
+## Architecture
+
+- Scalars: registered via rusqlite's
+  `Connection::create_scalar_function_with_state`, dispatched
+  one row at a time (SQLite is not vectorised).
+- Aggregates: rusqlite's `Aggregate` trait with state held
+  per-group in `Box<dyn Accumulator>`.
+- UDTFs: rusqlite VTab eponymous tables; output schema inferred
+  from `def.param_types()`.
+
+## License
+
+Apache-2.0. Generated source so the same license as the
+codegen.
+"##,
+    ));
     s
 }
 
