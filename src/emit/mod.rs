@@ -120,10 +120,14 @@ fn init_inner(conn: Connection) -> Result<bool> {
         )
     })?;
 
-    // Register Phase-1 scalars.
+    // Register scalars (Phase 2) + aggregates (Phase 3c).
     scalars::register_all(&conn)
         .map_err(|e| rusqlite::Error::UserFunctionError(
             format!("scalar registration: {e}").into()
+        ))?;
+    aggregates::register_all(&conn)
+        .map_err(|e| rusqlite::Error::UserFunctionError(
+            format!("aggregate registration: {e}").into()
         ))?;
 
     // Returning `true` means "extension fully initialized — no
@@ -307,7 +311,7 @@ fn dispatch_scalar<'a>(
 /// SQLite ValueRef → FunctionValue. Null/Real/Integer/Text/Blob
 /// map 1:1; nothing else is reachable through SQLite's value
 /// system.
-fn value_ref_to_function_value(v: ValueRef<'_>) -> FunctionValue {
+pub(crate) fn value_ref_to_function_value(v: ValueRef<'_>) -> FunctionValue {
     match v {
         ValueRef::Null => FunctionValue::Null,
         ValueRef::Integer(i) => FunctionValue::Int64(i),
@@ -321,7 +325,7 @@ fn value_ref_to_function_value(v: ValueRef<'_>) -> FunctionValue {
 
 /// FunctionValue → ToSqlOutput. Owned variants only — the
 /// SQLite layer will copy, so we don't try to borrow.
-fn function_value_to_tosql(v: FunctionValue) -> ToSqlOutput<'static> {
+pub(crate) fn function_value_to_tosql(v: FunctionValue) -> ToSqlOutput<'static> {
     let value = match v {
         FunctionValue::Null => Value::Null,
         FunctionValue::Boolean(b) => Value::Integer(b as i64),
@@ -385,6 +389,7 @@ static SHIM: OnceCell<ShimRegistry> = OnceCell::new();
 struct ShimRegistry {{
     _ext: RuntimeWasmExtension,  // keep the wasm Store alive
     scalars: RwLock<HashMap<String, Arc<dyn ScalarFunctionDef>>>,
+    aggregates: RwLock<HashMap<String, Arc<dyn AggregateFunctionDef>>>,
 }}
 
 pub fn load_shim() -> Result<()> {{
@@ -400,6 +405,7 @@ pub fn load_shim() -> Result<()> {{
 
     let mut capture = CapturingTarget {{
         scalars: Vec::new(),
+        aggregates: Vec::new(),
     }};
     ext.register(&mut capture)
         .map_err(|e| anyhow::anyhow!("shim register: {{e}}"))?;
@@ -412,10 +418,19 @@ pub fn load_shim() -> Result<()> {{
         }}
         scalars.insert(canonical, def);
     }}
+    let mut aggregates = HashMap::with_capacity(capture.aggregates.len() * 2);
+    for def in capture.aggregates {{
+        let canonical = def.name().to_string();
+        for alias in def.aliases() {{
+            aggregates.insert(alias.to_string(), Arc::clone(&def));
+        }}
+        aggregates.insert(canonical, def);
+    }}
 
     SHIM.set(ShimRegistry {{
         _ext: ext,
         scalars: RwLock::new(scalars),
+        aggregates: RwLock::new(aggregates),
     }}).map_err(|_| anyhow::anyhow!("ShimRegistry already initialised"))?;
 
     Ok(())
@@ -426,13 +441,18 @@ pub fn lookup_scalar(name: &str) -> Option<Arc<dyn ScalarFunctionDef>> {{
     r.scalars.read().get(name).cloned()
 }}
 
-/// Minimal ExtensionTarget that just collects every scalar the
-/// shim registers. We ignore other categories in Phase 1 —
-/// later phases extend this to capture aggregates / UDTFs /
-/// window functions / types / system catalog / spatial indexes
-/// in parallel maps.
+pub fn lookup_aggregate(name: &str) -> Option<Arc<dyn AggregateFunctionDef>> {{
+    let r = SHIM.get()?;
+    r.aggregates.read().get(name).cloned()
+}}
+
+/// ExtensionTarget that captures every scalar and aggregate the
+/// shim registers. UDTFs / windows / types / system catalogs /
+/// spatial indexes are accepted as no-ops (later phases extend
+/// this).
 struct CapturingTarget {{
     scalars: Vec<Arc<dyn ScalarFunctionDef>>,
+    aggregates: Vec<Arc<dyn AggregateFunctionDef>>,
 }}
 
 impl ExtensionTarget for CapturingTarget {{
@@ -447,8 +467,9 @@ impl ExtensionTarget for CapturingTarget {{
     fn register_aggregate_function(
         &mut self,
         _namespace: &str,
-        _def: Arc<dyn AggregateFunctionDef>,
+        def: Arc<dyn AggregateFunctionDef>,
     ) -> std::result::Result<(), ExtensionError> {{
+        self.aggregates.push(def);
         Ok(())
     }}
     fn register_table_function(
@@ -489,32 +510,163 @@ impl ExtensionTarget for CapturingTarget {{
 
 pub fn aggregates_rs(plan: &BridgePlan) -> String {
     let mut s = generated_header();
-    s.push_str(r##"//! Aggregate-function registration.
+    s.push_str(
+r##"//! Aggregate-function registration.
 //!
-//! SQLite aggregates use sqlite3_create_window_function (for
-//! window-capable aggregates) or sqlite3_create_function_v2 with
-//! step+final callbacks.
+//! Phase 3c (2026-06-24): wired via rusqlite's
+//! `Connection::create_aggregate_function`. Each shim
+//! AggregateFunctionDef becomes one ShimAggregate instance
+//! registered under every canonical + alias name.
 //!
-//! Shim aggregates are partition-aware: the host streams rows
-//! into the wasm guest's accumulator, then drains a final value.
+//! State plumbing:
+//!   - rusqlite's Aggregate<A, T> trait: A is the per-group
+//!     accumulator type, T is the SQL return value (must
+//!     impl ToSql). We use A = AccState (newtype around
+//!     Box<dyn Accumulator>) and T = ToSqlOutput<'static>.
+//!   - rusqlite requires A: RefUnwindSafe + UnwindSafe. The
+//!     shim's Accumulator trait doesn't promise either, so
+//!     AccState manually opts in (correctness rests on the
+//!     shim not panicking on accumulate/finalize — its
+//!     wasm-side impl uses Result, no unwinds expected).
 
-"##);
-    for ext in &plan.extensions {
-        for agg in &ext.aggregates {
-            s.push_str(&format!(
-                "// aggregate `{}` (grouped={}, partial={}, order_sensitive={}, accepts_config={})\n",
-                agg.canonical_name,
-                agg.supports_grouped,
-                agg.supports_partial,
-                agg.is_order_sensitive,
-                agg.accepts_config,
-            ));
-            if !agg.aliases.is_empty() {
-                s.push_str(&format!("//   aliases: {}\n", agg.aliases.join(", ")));
+use std::panic::{RefUnwindSafe, UnwindSafe};
+use std::sync::Arc;
+
+use rusqlite::functions::{Aggregate, Context, FunctionFlags};
+use rusqlite::types::{ToSqlOutput, Value};
+use rusqlite::{Connection, Result};
+
+use datafission_functions::traits::{Accumulator, AggregateFunctionDef};
+use datafission_functions::types::FunctionValue;
+
+use crate::registry;
+use crate::scalars::{function_value_to_tosql, value_ref_to_function_value};
+
+/// Per-group accumulator state with the UnwindSafe opt-in that
+/// rusqlite requires on `A`.
+struct AccState(Box<dyn Accumulator>);
+impl RefUnwindSafe for AccState {}
+impl UnwindSafe for AccState {}
+
+/// Stateless dispatcher: the per-group state lives in `AccState`,
+/// not in this struct. One instance per (name × registration).
+struct ShimAggregate {
+    def: Arc<dyn AggregateFunctionDef>,
+}
+
+impl Aggregate<AccState, ToSqlOutput<'static>> for ShimAggregate {
+    fn init(&self, _ctx: &mut Context<'_>) -> Result<AccState> {
+        Ok(AccState(self.def.create_accumulator()))
+    }
+
+    fn step(&self, ctx: &mut Context<'_>, acc: &mut AccState) -> Result<()> {
+        // PostGIS aggregates are unary (ST_Union, ST_Extent,
+        // ST_Collect — all take one geometry). For multi-arg
+        // future aggregates: walk every ctx arg and call
+        // accumulate per row's input tuple. The Accumulator
+        // trait takes one value per accumulate call.
+        let n = ctx.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let v = ctx.get_raw(0);
+        // NULL convention: SQL-92 aggregates skip NULL inputs
+        // (except COUNT(*)). The shim's Accumulator may also
+        // skip; pass NULL through and let the shim decide.
+        let value = value_ref_to_function_value(v);
+        acc.0.accumulate(&value).map_err(|e| {
+            rusqlite::Error::UserFunctionError(Box::new(
+                std::io::Error::other(format!("{e:?}"))
+            ))
+        })
+    }
+
+    fn finalize(
+        &self,
+        _ctx: &mut Context<'_>,
+        acc: Option<AccState>,
+    ) -> Result<ToSqlOutput<'static>> {
+        match acc {
+            Some(a) => {
+                let result = a.0.finalize().map_err(|e| {
+                    rusqlite::Error::UserFunctionError(Box::new(
+                        std::io::Error::other(format!("{e:?}"))
+                    ))
+                })?;
+                Ok(function_value_to_tosql(result))
+            }
+            None => {
+                // No rows accumulated → SQL aggregates return NULL.
+                // (Except COUNT, which would return 0 — but that
+                // never reaches this branch in practice.)
+                let _ = self;
+                let _ = FunctionValue::Null;
+                Ok(ToSqlOutput::Owned(Value::Null))
             }
         }
     }
-    s.push_str("\n// TODO: emit sqlite3_create_function_v2 calls with step+final.\n");
+}
+
+/// Register every aggregate the shim publishes.
+pub fn register_all(conn: &Connection) -> Result<()> {
+"##,
+    );
+
+    let mut canonical = 0;
+    let mut alias_count = 0;
+    for ext in &plan.extensions {
+        for agg in &ext.aggregates {
+            let variants = &agg.param_signatures;
+            let arity = if variants.is_empty() {
+                -1i32
+            } else {
+                let first = variants[0].len();
+                if variants.iter().all(|v| v.len() == first) {
+                    first as i32
+                } else {
+                    -1
+                }
+            };
+            s.push_str(&format!(
+                "    register_aggregate(conn, \"{name}\", {arity})?;\n",
+                name = agg.canonical_name,
+            ));
+            for alias in &agg.aliases {
+                s.push_str(&format!(
+                    "    register_aggregate(conn, \"{alias}\", {arity})?; // alias of {name}\n",
+                    alias = alias, name = agg.canonical_name,
+                ));
+                alias_count += 1;
+            }
+            canonical += 1;
+        }
+    }
+    s.push_str(&format!(
+        "    // Phase 3c: {canonical} canonical + {alias_count} alias names registered.\n"
+    ));
+    if canonical == 0 {
+        s.push_str("    // (no aggregates in this interface DB)\n");
+    }
+
+    s.push_str(
+r##"    Ok(())
+}
+
+fn register_aggregate(conn: &Connection, sql_name: &str, arity: i32) -> Result<()> {
+    let def = registry::lookup_aggregate(sql_name).ok_or_else(|| {
+        rusqlite::Error::UserFunctionError(
+            format!("aggregate `{sql_name}` not registered by the shim").into()
+        )
+    })?;
+    conn.create_aggregate_function(
+        sql_name,
+        arity,
+        FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_UTF8,
+        ShimAggregate { def },
+    )
+}
+"##,
+    );
     s
 }
 
