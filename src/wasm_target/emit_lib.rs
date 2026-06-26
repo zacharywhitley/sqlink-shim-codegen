@@ -338,6 +338,9 @@ fn emit_metadata_impl(plan: &BridgePlan, bridge_struct: &str) -> String {
             has_wal_hook: false,
             wal_hook_id: 0,
             declared_capabilities: alloc::vec![],
+            optional_capabilities: alloc::vec![],
+            preferred_prefix: None,
+            prefix_expansion: None,
         }}
     }}
 }}

@@ -57,16 +57,63 @@ pub fn write_world(plan: &BridgePlan, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Copy the dependency WIT tree into `wit/deps/`. Source layout
-/// is the hand-written postgis-bridge's `wit/deps/` directory.
+/// Copy the dependency WIT tree into `wit/deps/`.
+///
+/// Two source roots are wired in:
+///
+///   * `sqlite-extension/` — the canonical sqlite:extension@0.1.0
+///     package. Sourced from `sqlink-loader-wit/wit/` (the
+///     in-tree source of truth that the host bindgen targets).
+///     The hand-written `extensions/postgis-bridge/wit/deps/
+///     sqlite-extension/` is STALE relative to this  the host's
+///     `loaded` bindgen sees newer manifest fields
+///     (`optional-capabilities`, `preferred-prefix`,
+///     `prefix-expansion`, wal-hook interface, ...) and rejects a
+///     guest whose Manifest record is missing them as
+///     "failed to convert function to given type". Using the
+///     host's wit/ is the only path that loads cleanly through
+///     `Host::load_extension`.
+///
+///   * `postgis-wasm/` + `sfcgal-component/` — the upstream shim
+///     WIT for postgis-wasm. Sourced from the hand-written
+///     bridge's `wit/deps/` directory (no stale-version concern
+///     there  postgis-wasm's release contract is what
+///     `postgis-composed.wasm` was built against).
 pub fn write_deps(_plan: &BridgePlan, deps_dir: &Path) -> Result<()> {
-    let src = source_deps_dir()?;
-    copy_tree(&src, deps_dir).with_context(|| {
-        format!("copying WIT deps from {} to {}", src.display(), deps_dir.display())
-    })
+    let shim_src = source_shim_deps_dir()?;
+    // Copy the shim-side packages (postgis-wasm/, sfcgal-component/)
+    // from the hand-written bridge's deps.
+    for sub in ["postgis-wasm", "sfcgal-component"] {
+        let from = shim_src.join(sub);
+        let to = deps_dir.join(sub);
+        if !from.is_dir() {
+            return Err(anyhow!(
+                "expected shim WIT package at {}",
+                from.display()
+            ));
+        }
+        copy_tree(&from, &to).with_context(|| {
+            format!("copying {} -> {}", from.display(), to.display())
+        })?;
+    }
+
+    // Copy the sqlite-extension WIT package from the host's
+    // wit/ — the canonical source of truth the host bindgen
+    // targets. Vendored as deps/sqlite-extension/.
+    let host_wit = source_host_wit_dir()?;
+    let host_dst = deps_dir.join("sqlite-extension");
+    copy_tree(&host_wit, &host_dst).with_context(|| {
+        format!(
+            "copying host wit/ {} -> {}",
+            host_wit.display(),
+            host_dst.display()
+        )
+    })?;
+    Ok(())
 }
 
-/// Locate the source `wit/deps/` directory.
+/// Locate the source `wit/deps/` directory for the upstream
+/// shim WIT packages (postgis-wasm, sfcgal-component).
 ///
 /// Resolution order:
 ///   1. `$SQLINK_POSTGIS_BRIDGE_WIT_DEPS` (explicit override)
@@ -74,7 +121,7 @@ pub fn write_deps(_plan: &BridgePlan, deps_dir: &Path) -> Result<()> {
 ///   3. `../sqlink/extensions/postgis-bridge/wit/deps` (relative
 ///      to current working dir  matches the codegen running
 ///      inside `~/git/sqlink-shim-codegen/`)
-fn source_deps_dir() -> Result<PathBuf> {
+fn source_shim_deps_dir() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("SQLINK_POSTGIS_BRIDGE_WIT_DEPS") {
         let p = PathBuf::from(p);
         if p.is_dir() {
@@ -99,6 +146,41 @@ fn source_deps_dir() -> Result<PathBuf> {
     Err(anyhow!(
         "cannot locate postgis-bridge wit/deps. Set \
          SQLINK_POSTGIS_BRIDGE_WIT_DEPS=/path/to/sqlink/extensions/postgis-bridge/wit/deps"
+    ))
+}
+
+/// Locate sqlink's `sqlite-loader-wit/wit/` directory  the
+/// canonical sqlite:extension WIT source the host bindgen
+/// targets.
+///
+/// Resolution order:
+///   1. `$SQLINK_LOADER_WIT` (explicit override)
+///   2. `$HOME/git/sqlink/sqlite-loader-wit/wit`
+///   3. `../sqlink/sqlite-loader-wit/wit`
+fn source_host_wit_dir() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("SQLINK_LOADER_WIT") {
+        let p = PathBuf::from(p);
+        if p.is_dir() {
+            return Ok(p);
+        }
+        return Err(anyhow!(
+            "SQLINK_LOADER_WIT={} does not exist",
+            p.display()
+        ));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let p = PathBuf::from(home).join("git/sqlink/sqlite-loader-wit/wit");
+        if p.is_dir() {
+            return Ok(p);
+        }
+    }
+    let rel = PathBuf::from("../sqlink/sqlite-loader-wit/wit");
+    if rel.is_dir() {
+        return Ok(rel);
+    }
+    Err(anyhow!(
+        "cannot locate sqlite-loader-wit/wit. Set \
+         SQLINK_LOADER_WIT=/path/to/sqlink/sqlite-loader-wit/wit"
     ))
 }
 
