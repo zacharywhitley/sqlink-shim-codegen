@@ -40,6 +40,7 @@ use anyhow::{Context, Result};
 use crate::core::BridgePlan;
 use crate::rustfmt_files;
 
+mod dispatch;
 mod emit_cargo;
 mod emit_lib;
 mod emit_readme;
