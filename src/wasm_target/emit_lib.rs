@@ -65,6 +65,20 @@ use bindings::exports::sqlite::extension::vtab::{{
 }};
 use bindings::sqlite::extension::types::{{FunctionFlags, SqlValue}};
 
+// Phase 1: keep the upstream postgis imports live so wac plug
+// has a non-empty plug surface. The hand-written bridge in
+// sqlink/extensions/postgis-bridge calls these symbols
+// throughout its scalar/aggregate dispatch; Phase 2 reproduces
+// that mechanically and removes this anchor. For Phase 1 we
+// just need at least one import to survive dead-code
+// elimination so the composed wasm has the expected provenance
+// (bridge + postgis-composed).
+use bindings::postgis::wasm::postgis_constructors as pg_ctor;
+use bindings::postgis::wasm::postgis_accessors as pg_acc;
+use bindings::postgis::wasm::postgis_measurements as pg_meas;
+use bindings::postgis::wasm::postgis_predicates as pg_pred;
+use bindings::postgis::wasm::postgis_output as pg_out;
+
 const BRIDGE_NAME: &str = "{crate_name}";
 
 /// Phase 1 stub marker. Returned by every dispatch entry point
@@ -78,6 +92,29 @@ fn stubbed(kind: &str, func_id: u64) -> String {{
         kind = kind,
         func_id = func_id,
     )
+}}
+
+/// Phase 1 import anchor. Never invoked at runtime  the
+/// `unreachable!()` after the calls aborts before any postgis
+/// import fires  but the linker keeps the imports live because
+/// the call sites compile in. Phase 2 deletes this when the
+/// real dispatch table starts using these imports for actual
+/// work.
+#[doc(hidden)]
+#[no_mangle]
+pub extern "C" fn __phase1_postgis_import_anchor(seed: f64) -> f64 {{
+    // Guard so the anchor never fires in real execution. The
+    // `core::hint::black_box` calls below are still emitted by
+    // the codegen, which is what keeps the WIT imports linked
+    // into the component.
+    if seed.is_nan() {{
+        let g = pg_ctor::st_make_point(seed, seed);
+        let _ = core::hint::black_box(pg_acc::st_x(&g));
+        let _ = core::hint::black_box(pg_meas::st_area(&g));
+        let _ = core::hint::black_box(pg_pred::st_intersects(&g, &g));
+        let _ = core::hint::black_box(pg_out::st_as_text(&g));
+    }}
+    seed
 }}
 
 struct {bridge_struct};
